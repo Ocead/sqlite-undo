@@ -1,0 +1,17 @@
+AC_INIT(sqlite-undo, 0.1, snaunton@gmail.com)
+AM_INIT_AUTOMAKE
+AC_PROG_CC
+AC_PROG_INSTALL
+AC_PROG_MAKE_SET
+AC_DISABLE_STATIC
+AM_PROG_LIBTOOL
+AC_CONFIG_MACRO_DIR([m4])
+
+PKG_CHECK_MODULES(sqlite, sqlite3 >= 3.6.10)
+AC_SUBST(sqlite_CFLAGS)
+AC_SUBST(sqlite_LIBS)
+
+AC_CONFIG_FILES([
+Makefile
+src/Makefile])
+AC_OUTPUT
