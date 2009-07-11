@@ -1,4 +1,4 @@
-AC_INIT(sqlite-undo, 0.1, snaunton@gmail.com)
+AC_INIT(sqlite-undo, 0.2, snaunton@gmail.com)
 AM_INIT_AUTOMAKE
 AC_PROG_CC
 AC_PROG_INSTALL

@@ -1,0 +1,10 @@
+2009-07-11 14:25  snaunton
+
+	* Bumped version to 0.2
+	  Bug fix: Use rowids as ids in undo triggers (WTF was I thinking?)
+	  Bug fix: Only undoable queries get entered into _undo now
+	  Removed more unnecessary "WTF was I thinking!?!?!" code
+	  Use #defines instead of array for error messages
+	  Added prefixes and code to allow static builds inside sqlite3
+		- thanks to Alexey Pechnikov for pointing me towards this
+	  Re-wrote documentation

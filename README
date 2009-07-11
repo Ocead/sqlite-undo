@@ -1,13 +1,12 @@
 
-                    Sqlite Undo
+                               sqlite-undo
 
 What is it?
 -----------
 
-sqlite-undo is a A loadable extension for sqlite with the aim of 
-providing "drop in" undo/redo functionality for databases used by 
-single user applications or possibly multi-user applications
-where users use separate data sets.
+sqlite-undo is a loadable extension for sqlite with the aim of providing 
+"drop in" undo/redo functionality for databases used by single user applications
+or possibly multi-user applications where users use separate data sets.
 
 Many of the design ideas were cribbed from:
 
@@ -21,8 +20,8 @@ http://www.sqlite.org
 The Latest Version
 ------------------
 
-Details of the latest version can be found on the Sqlite Undo
-Extension sourceforge project page:
+Details of the latest version can be found on the sqlite-undo sourceforge
+project page:
 
 https://sourceforge.net/projects/sqlite-undo/
 
@@ -30,184 +29,194 @@ https://sourceforge.net/projects/sqlite-undo/
 Documentation
 -------------
 
-The shared library sqlite-undo.so is loaded using sqlite's
-load_extension function. See the sqlite documentation at 
-http://www.sqlite.org/lang_corefunc.html for further 
-information.
+sqlite-undo is an extension to sqlite3 which allows transactional undo/redo
+functionality to be either compiled directly into sqlite3 or to be loaded at
+runtime using the load_extension functionality of sqlite3. Note that
+sqlite-undo is licensed under the GPL v3 while sqlite is in the public domain.
+This will affect how you are able to distribute a package where sqlite-undo
+is statically linked to sqlite. Please see the file called LICENSE or refer
+to another copy of the GPL v3 license for further information.
 
-At the time of writing the syntax for loading the module using
-SQL on Linux is:
+If using the loadable extension (sqlite-undo.so), the first step in enabling 
+undo functionality is to load the extension. Currently, this is done like so:
 
 SELECT load_extension('/path/to/sqlite-undo.so');
 
-When loaded it creates the following temporary objects on the
-current database connection:
+See the sqlite documentation at http://www.sqlite.org/lang_corefunc.html for
+further information on using the load_extension functionality. It uses the 
+default entry point so does not need an entry point specified explicitly.
 
-_undo
-A temporary table to store the undo/redo log
+IMPORTANT NOTE: All functions discussed below, with the exception of
+undoable_table() use the BEGIN, COMMIT and ROLLBACK statements. As sqlite does
+not allow nested transactions these functions should not be called within
+transactions. Further more, as the undo functionality uses it's own temporary
+tables to store data very careful consideration must be given to when to use
+SAVEPOINTs.
 
-_undo_stack
-A temporary view containing the bounds of individual undoable
-transactions in _undo
+The second step, or first step if statically linked is to make all tables that
+require undo functionality undoable. This is done using the undoable() function
+which has the following syntax:
 
-_undo_stack_top
-A temporary view which returns the transaction at the top of
-_undo_stack
+undoable_table('x', y)
 
-_redo_stack
+x: The name of the table to make undoable. This is a text parameter, so must be 
+   enclosed in quotes.
+y: This is an integer parameter which must be either 0, 1 or 2. It defines how
+   the triggers used to undo UPDATEs to the table are defined.
+   - 0: Use this if no UPDATEs are going to be made against the table.
+   - 1: Use this if UPDATEs are usually made on the whole table or several
+        columns at a time.
+   - 2: Use this if UPDATEs are usually made one column at a time.
+
+1 and 2 above will work for all UPDATEs against the table, but are more
+effecient for their respective usages noted above.
+
+NOTE: As primary keys should not be UPDATEed, all columns defined as 
+primary keys will be ignored and will not be undoable for UPDATEs.
+
+Example:
+
+> CREATE TABLE Test(id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT);
+> SELECT undoable_table('Test', 2);
+
+Initialization is now complete.
+
+There are two ways to make a transaction undoable:
+
+1) undoable('x')
+2) undoable_begin() -> undoable_end()
+
+undoable('x')
+x: A text string of of valid SQL commands. As this is a text string the rules
+   regarding quotes must be followed. All statements in x are considered to be
+   one transaction.
+
+The function returns the number of transactions the can be undone and the 
+number of transactions that can be redone as a text string or an sqlite 
+error code if an error occurred - usually as a result of incorrect SQL supplied
+in parameter x.
+
+IMPORTANT: All SQL executed by undoable is executed with a BEGIN and COMMIT or
+ROLLBACK, therefore you cannot use a BEGIN and should not use a COMMIT within
+the transaction. A ROLLBACK will be handled, but the undo transaction will have
+ended if one is used. This should also take this into consideration if/when
+using SAVEPOINTs.
+
+Example:
+
+> SELECT undoable('INSERT INTO Test(data) VALUES(''Hello'');\
+	INSERT INTO Test(data) VALUES(''Goodbye'')');
+UNDO=1
+REDO=0
+
+This executes the two INSERT statements in the text string and returns a text 
+string showing that there is one transaction that can be undone and no 
+transactions that can be redone.
+
+
+undoable_begin()
+... 
+...
+...
+undoable_end()
+
+These functions signify the beginning and end of an undoable transaction. All
+SQL statments exectuted between them will be considered part of the same
+transaction. undoable_end() returns a text string containing the number of
+transactions the can be undone and the number of transactions that can be redone
+as a text string or an sqlite error code if an error occurred.
+
+NOTE: All SQL executed between undoable_begin() and undoable_end() is executed
+between a BEGIN and COMMIT or ROLLBACK, therefore you cannot use a BEGIN and 
+should not use a COMMIT within the transaction. A ROLLBACK will be handled,
+but the transaction will have ended if one is used. If a ROLLBACK occurs for any
+reason undoable_end() should still be called or the entire undo system may fall
+apart. This should also be taken into consideration if/when using SAVEPOINTs.
+
+Example:
+
+> SELECT undoable_begin();
+> INSERT INTO Test(data) VALUES('Hello');
+> INSERT INTO Test(data) VALUES('Goodbye');
+> SELECT undoable_end();
+UNDO=1
+REDO=0
+
+This executes the two INSERT statements making them undoable.
+SELECT undoable_end() returns a string showing that there is one transaction
+that can be undone and no transactions that can be redone.
+
+To execute an undo or redo the following functions are used:
+
+undo()
+redo()
+
+On success, both functions return a text string containing the number of
+transactions the can be undone, the number of transactions that can be redone
+ and the SQL used to undo or redo the transaction as a text string.
+If there is nothing to redo or undo NULL is returned.
+If an error occurs an sqlite error code is returned.
+
+NOTE: All SQL executed by these functions is executed between a BEGIN and COMMIT
+or ROLLBACK, therefore you should not execute these functions within a
+transaction. This should also be taken into consideration if/when using
+SAVEPOINTs.
+
+Example:
+
+> SELECT undoable_begin();
+> INSERT INTO Test(data) VALUES('Hello');
+> INSERT INTO Test(data) VALUES('Goodbye');
+> SELECT undoable_end();
+UNDO=1
+REDO=0
+> SELECT * FROM Test;
+Hello
+Goodbye
+> SELECT undo();
+UNDO=0
+REDO=1
+SQL=DELETE FROM test WHERE rowid=1;DELETE FROM test WHERE rowid=2
+> SELECT * FROM Test;
+> SELECT redo();
+UNDO=1
+REDO=0
+SQL=INSERT INTO test(rowid,data) VALUES(1,'Hello');\
+INSERT INTO test(rowid,data) VALUES(2,'Goodbye')
+> SELECT * FROM Test;
+Hello
+Goodbye
+
+When loaded or enabled sqlite undo creates the following temporary objects on
+the current database connection. The objects below need not and should not be
+used directly, but obviously their names are reserved and cannot be used by
+other objects in the database or database connection.
+
+TABLE _undo
+A temporary table to store the SQL and control statements required to undo or
+redo a transaction.
+
+TABLE _undo_active
+A temporary table which should contain only one row with one field called
+'active'. If 'active' IS NOT NULL then any changes made to undoable tables are
+made undoable. If 'active' is NULL then any changes made to undoable tables are
+not undoable.
+
+VIEW _undo_stack
+A temporary view containing the bounds of individual undoable transactions 
+in _undo
+
+VIEW _undo_stack_top
+A temporary view which returns the transaction at the top of _undo_stack
+
+VIEW _redo_stack
 The same as _undo_stack, but for redoable transactions
 
-_redo_stack_top
+VIEW _redo_stack_top
 The same as _undo_stack_top, but for redoable transactions
 
-_redo_row_ids
-A temporary view which lists all the rowids related to redoable
-transactions.
-
-The following functions are also created:
-
-undoable_table('[table]', [UpdateTriggerType])
-This function creates temporary triggers which record the
-query needed to undo or redo changed made against [table]
-in the temporary table _undo.
-
-[table] is a text string and therefore must be enclosed within
-quotes - see "Usage example" below.
-
-[UpdateTriggerType] determines how UPDATE triggers are created
-and must be a value of 0, 1 or 2.
-
-A value of 0 means that no tiggers will be created, therefore
-UPDATE statements will not be undoable.
-
-A value of 1 means that one trigger will be created to handle
-updates to the entire row of data. So if only one column is
-updated _undo will contain an update statement that updates
-every column in the row, whether changed or not. Use this if
-your application mostly updates the entire row with one
-statement.
-
-A value of 2 means that there will be one trigger created for
-each non-primary key column. Use this if your application
-mostly updates one column at a time.
-
-Usage example:
-
-SELECT undoable_table('MyUndoableTable', 1);
-
-
-undoable('[sql]')
-Execute [sql] and make it undoable.
-
-All undoable queries must be executed using this function or
-between undoable_begin() and undoable_end() functions below.
-
-[sql] is passed directly to sqlite3_exec().
-
-[sql] is a text string and therefore must be enclosed in
-quotes. This has the side effect of requiring two quotes
-adjacent to each other if a quote character is required in
-the sql.
-
-BEGIN, COMMIT and ROLLBACK statements are used internally in
-the function so as sqlite does not allow nested transactions
-you should not include any BEGIN, COMMIT or ROLLBACK statements
-in[sql]. If a ROLLBACK occurs, perhaps as the result of a
-trigger, then the error message "A rollback occurred" is 
-returned. Any other error is an error code returned by
-an sqlite3_exec() call.
-
-On success, this function returns the following text string:
-
-UNDO=[int]
-REDO=[int]
-
-The UNDO and REDO values are the number of transactions in
-the respective stacks. This is returned so, for instance,
-a GUI can enable or disable undo and redo buttons.
-
-Usage example:
-
-SELECT undoable('INSERT INTO MyUndoableTable(data) VALUES(''MyData'')');
-
-
-undoable_begin()
-[sql1]
-...
-[sqlN]
-undoable_end()
-These are an alternative to using undoable('[sql]'). Any sql
-executed between a call to undoable_begin() and a call to 
-undoable_end() will be considered a single undoable transaction
-and will be undone or redone with a single call to undo() or
-redo(). As with undoable('[SQL]') BEGIN, COMMIT and ROLLBACK 
-statments should not be used between calls to these two functions.
-
-undoable_end() returns the following text string on success:
-
-UNDO=[int]
-REDO=[int]
-
-The UNDO and REDO values are the number of transactions in
-the respective stacks. This is returned so, for instance,
-a GUI can enable or disable undo and redo buttons.
-
-If a ROLLBACK occurs, perhaps as the result of a trigger,
-then the error message "A rollback occurred" is returned
-by undoable_end();
-
-Any other error returned by either function is the error
-code returned by an sqlite3_exec() call.
-
-Usage example:
-
-SELECT undoable_begin();
-INSERT INTO MyUndoableTable(data) VALUES('data1');
-INSERT INTO MyUndoableTable(data) VALUES('data2');
-INSERT INTO MyUndoableTable(data) VALUES('data3');
-INSERT INTO MyUndoableTable(data) VALUES('data4');
-SELECT undoable_end();
-
-
-undo()
-redo()
-These functions undo or redo the transaction at the top of 
-the undo stack and redo stack respectively.
-
-They both return NULL if there are no transactions in their
-respective stacks or a text string like so if there is:
-
-UNDO=[int]
-REDO=[int]
-SQL=[text]
-
-The UNDO and REDO values are the number of transactions in
-the respective stacks. They are returned so, for instance,
-a GUI can enable or disable undo and redo buttons.
-
-SQL is the actual sql that was undone or redone. This is
-returned so, for instance - again, a GUI can parse it to
-determine what to display on the screen.
-
-Summary:
-
-Database Objects:
-
-TEMP TABLE _undo
-TEMP VIEW _undo_stack
-TEMP VIEW _undo_stack_top
-TEMP VIEW _redo_stack
-TEMP VIEW _redo_stack_top
-TEMP VIEW _redo_row_ids
-
-Functions:
-
-undoable_table('[table]',[UndoTriggerType])
-undoable('[sql]')
-undoable_begin()
-undoable_end()
-undo()
-redo()
+VIEW _redo_row_ids
+A temporary view which lists all the rowids related to redoable transactions.
 
 
 Installation
