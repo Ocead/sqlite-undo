@@ -1,8 +1,11 @@
 /*
  *      sqlite_undo.c
- *      
+ *
  *      Copyright 2009 Simon Naunton <snaunton@gmail.com>
- *      
+ *
+ *      Merge back of some code from a fork of sqlite-undo project by Alexey
+ *      Pechnikov <pechnikov@mobigroup.ru>
+ *
  *      This program is free software; you can redistribute it and/or modify
  *      it under the terms of the GNU General Public License as published by
  *      the Free Software Foundation; either version 3 of the License, or
@@ -22,10 +25,6 @@
 #include <assert.h>
 #include <stdlib.h>
 
-#ifndef NDEBUG
-	#include <string.h>
-#endif 
-
 #ifndef SQLITE_CORE
 	#include <sqlite3ext.h>
 	SQLITE_EXTENSION_INIT1
@@ -33,17 +32,24 @@
 	#include "sqlite3.h"
 #endif
 
+typedef struct {
+	char *name;
+	int nargs;
+	void *func;
+} SqliteUndoFunction;
+
 typedef enum {
 	SqliteUndoUpdateTypeNone,
 	SqliteUndoUpdateTypeTable,
 	SqliteUndoUpdateTypeColumn
 } SqliteUndoUpdateType;
 
-typedef struct {
-	char *name;
-	int nargs;
-	void *func;
-} SqliteUndoFunction;
+typedef enum {
+	SqliteUndoUndo,
+	SqliteUndoRedo
+} SqliteUndoOrRedo;
+
+int sqlite_undo_undoable_active_flag = 0;
 
 #define SQLITE_UNDO_ERRMSG_TABLE_MUST_BE_TEXT \
 	"Table name must be a text string"
@@ -52,10 +58,14 @@ typedef struct {
 	"0: None\n" \
 	"1: Table\n" \
 	"2: Column"
-#define SQLITE_UNDO_ERRMSG_CREATE_TRIGGER_FAILED "Failed to create triggers"
-#define SQLITE_UNDO_ERRMSG_SQL_MUST_BE_TEXT 	 "SQL must be a text string"
-#define SQLITE_UNDO_ERRMSG_ROLLBACK_OCCURRED     "A ROLLBACK occurred"
-#define SQLITE_UNDO_ERRMSG_COMMIT_FAILED	 "COMMIT failed"
+#define SQLITE_UNDO_ERRMSG_CREATE_TRIGGER_FAILED \
+	"Failed to create triggers"
+#define SQLITE_UNDO_ERRMSG_UNDOABLE_ACTIVE	"Undoable is active"
+#define SQLITE_UNDO_ERRMSG_UNDOABLE_NOT_ACTIVE	"Undoable is not active"
+
+#define SQLITE_UNDO_TABLE		"_sqlite_undo"
+#define SQLITE_UNDO_SAVEPOINT_UNDOABLE	"_sqlite_undo_undoable"
+#define SQLITE_UNDO_SAVEPOINT_UNDO	"_sqlite_undo_undo"
 
 static char *sqlite_undo_add_delete_column(char *columns, char *column)
 {
@@ -119,12 +129,14 @@ static char *sqlite_undo_append_update_column_trigger(char *triggers,
 	r = sqlite3_mprintf(
 		"%s"
 		"CREATE TEMP TRIGGER _u_%s_u_%s AFTER UPDATE OF %s ON %s "
-		"WHEN (SELECT active FROM _undo_active) IS NOT NULL "  
+		"WHEN (SELECT undoable_active())=1 "  
 		"BEGIN "
-			"INSERT INTO _undo "
-			"VALUES("
-				"'UPDATE %s SET %s='||quote(OLD.%s)||'"
-				"WHERE rowid='||OLD.rowid"
+			"UPDATE " SQLITE_UNDO_TABLE " "
+			"SET sql=sql || "
+				"'UPDATE %s SET %s "
+				"WHERE rowid='||OLD.rowid||';' "
+			"WHERE ROWID=("
+				"SELECT MAX(ROWID) FROM " SQLITE_UNDO_TABLE
 			");"
 		"END;",
 		triggers ? triggers : "",
@@ -148,12 +160,14 @@ static char *sqlite_undo_prepend_update_table_trigger(char *triggers,
 	r = sqlite3_mprintf(
 		"%s"
 		"CREATE TEMP TRIGGER _u_%s_u AFTER UPDATE ON %s "
-		"WHEN (SELECT active FROM _undo_active) IS NOT NULL " 
+		"WHEN (SELECT undoable_active())=1 " 
 		"BEGIN "
-			"INSERT INTO _undo "
-			"VALUES("
+			"UPDATE " SQLITE_UNDO_TABLE " "
+			"SET sql=sql || "
 				"'UPDATE %s SET %s "
-				"WHERE rowid='||OLD.rowid"
+				"WHERE rowid='||OLD.rowid||';' "
+			"WHERE ROWID=("
+				"SELECT MAX(ROWID) FROM " SQLITE_UNDO_TABLE
 			");"
 		"END;",
 		triggers ? triggers : "",
@@ -176,12 +190,14 @@ static char *sqlite_undo_prepend_delete_trigger(char *triggers, char *table,
 
 	r = sqlite3_mprintf(
 		"CREATE TEMP TRIGGER _u_%s_d BEFORE DELETE ON %s "
-		"WHEN (SELECT active FROM _undo_active) IS NOT NULL " 
+		"WHEN (SELECT undoable_active())=1 " 
 		"BEGIN "
-			"INSERT INTO _undo "
-			"VALUES("
+			"UPDATE " SQLITE_UNDO_TABLE " "
+			"SET sql=sql ||"
 				"'INSERT INTO %s(rowid,%s) "
-				"VALUES('||OLD.rowid||'%s)'"
+				"VALUES('||OLD.rowid||'%s);' "
+			"WHERE ROWID=("
+				"SELECT MAX(ROWID) FROM " SQLITE_UNDO_TABLE 
 			");"
 		"END;"
 		"%s",
@@ -202,12 +218,14 @@ static char *sqlite_undo_prepend_insert_trigger(char *triggers, char *table)
 
 	r = sqlite3_mprintf(
 		"CREATE TEMP TRIGGER _u_%s_i AFTER INSERT ON %s "
-		"WHEN (SELECT active FROM _undo_active) IS NOT NULL " 
+		"WHEN (SELECT undoable_active())=1 " 
 		"BEGIN "
-			"INSERT INTO _undo "
-			"VALUES("
+			"UPDATE " SQLITE_UNDO_TABLE " "
+			"SET sql=sql || "
 				"'DELETE FROM %s "
-				"WHERE rowid='||NEW.rowid"
+				"WHERE rowid='||NEW.rowid||';' "
+			"WHERE ROWID=("
+				"SELECT MAX(ROWID) FROM " SQLITE_UNDO_TABLE
 			");"
 		"END;"
 		"%s",
@@ -221,7 +239,7 @@ static char *sqlite_undo_prepend_insert_trigger(char *triggers, char *table)
 }
 
 static char *sqlite_undo_get_table_undo_triggers(sqlite3 *db, char *table,
-				SqliteUndoUpdateType update_type)
+					SqliteUndoUpdateType update_type)
 {
 	int rc, pk;
 	char *sql, *name, *delete_names = NULL, *delete_values = NULL,
@@ -230,10 +248,6 @@ static char *sqlite_undo_get_table_undo_triggers(sqlite3 *db, char *table,
 
 	assert(db);
 	assert(table);
-	assert((update_type == SqliteUndoUpdateTypeNone) ||
-		(update_type == SqliteUndoUpdateTypeTable) ||
-		(update_type == SqliteUndoUpdateTypeColumn));
-
 /*
 	PRAGMA table_info([table]) returns:
 
@@ -254,39 +268,39 @@ static char *sqlite_undo_get_table_undo_triggers(sqlite3 *db, char *table,
 	}
 		
 	while ((rc = sqlite3_step(stmt)) != SQLITE_DONE) {
-		if (rc == SQLITE_ROW) {
-			pk = sqlite3_column_int(stmt, 5);
-			name = (char*)sqlite3_column_text(stmt, 1);
-			
-			delete_names = sqlite_undo_add_delete_column(
-								delete_names,
-								name);
-			delete_values = sqlite_undo_add_delete_value(
-								delete_values,
-								name);
 
-			if (pk) {
-				continue;
-			}
-
-			switch (update_type) {
-			case SqliteUndoUpdateTypeColumn :
-				triggers =
-					sqlite_undo_append_update_column_trigger(
-								triggers,
-								table,
-								name);
-				break;
-			case SqliteUndoUpdateTypeTable :
-				update_columns = sqlite_undo_add_update_column(
-								update_columns,
-								name);
-				break;
-			case SqliteUndoUpdateTypeNone :
-				break;
-			}
+		if (rc != SQLITE_ROW) {
+			break;
 		}
-		else {
+
+		pk = sqlite3_column_int(stmt, 5);
+		name = (char*)sqlite3_column_text(stmt, 1);
+			
+		delete_names = sqlite_undo_add_delete_column(
+							delete_names,
+							name);
+		delete_values = sqlite_undo_add_delete_value(
+							delete_values,
+							name);
+
+		if (pk) {
+			continue;
+		}
+
+		switch (update_type) {
+		case SqliteUndoUpdateTypeColumn :
+			triggers =
+				sqlite_undo_append_update_column_trigger(
+							triggers,
+							table,
+							name);
+			break;
+		case SqliteUndoUpdateTypeTable :
+			update_columns = sqlite_undo_add_update_column(
+							update_columns,
+							name);
+			break;
+		case SqliteUndoUpdateTypeNone :
 			break;
 		}
 	}
@@ -323,7 +337,7 @@ static char *sqlite_undo_get_table_undo_triggers(sqlite3 *db, char *table,
 static void sqlite_undo_undoable_table(sqlite3_context *context, int argc,
 			sqlite3_value **argv)
 {
-	int rc;;
+	int rc;
 	SqliteUndoUpdateType update_type;
 	char *table, *triggers;
 	sqlite3 *db;
@@ -378,8 +392,8 @@ static sqlite_int64 sqlite_undo_get_buffer_status(sqlite3 *db, char U_R)
 
 	rc =  sqlite3_prepare_v2(db,
 			"SELECT count(*) "
-			"FROM _undo "
-			"WHERE s=?",
+			"FROM " SQLITE_UNDO_TABLE " "
+			"WHERE status=?",
 			-1, &stmt, NULL);
 
 	sqlite3_bind_text(stmt, 1, &U_R, 1, NULL);
@@ -397,43 +411,48 @@ static sqlite_int64 sqlite_undo_get_buffer_status(sqlite3 *db, char U_R)
 	return c;
 }
 
-static int sqlite_undo_undoable_begin_do(sqlite3_context *context, int argc,
+static void sqlite_undo_undoable_begin(sqlite3_context *context, int argc,
 			sqlite3_value **argv)
 {
 	int rc;
 	sqlite3 *db;
 
+	if (sqlite_undo_undoable_active_flag != 0) {
+		sqlite3_result_error(context,
+				SQLITE_UNDO_ERRMSG_UNDOABLE_ACTIVE, -1);
+		return;
+	}
+
 	db = sqlite3_context_db_handle(context);
 
-	rc = sqlite3_exec(db, 
-			"BEGIN;"
+	rc = sqlite3_exec(db,
+			"SAVEPOINT " SQLITE_UNDO_SAVEPOINT_UNDOABLE ";"
 			/* Delete redos */
-			"DELETE FROM _undo "
-			"WHERE rowid IN ("
-				"SELECT rowid "
-				"FROM _redo_row_ids"
-			");"
+			"DELETE FROM " SQLITE_UNDO_TABLE " WHERE status='R';"
 			/* Prepare for an undo entry */
-			"INSERT INTO _undo(s) "
-			"VALUES('U');"
-			/* Undoable transaction is active */
-			"UPDATE _undo_active SET active=1;",
+			"INSERT INTO " SQLITE_UNDO_TABLE "(sql, status) "
+			"VALUES('','U');",
 			NULL, NULL, NULL);
 
-	
 	if (rc != SQLITE_OK) {
+		sqlite3_exec(db,
+			"ROLLBACK TO SAVEPOINT " SQLITE_UNDO_SAVEPOINT_UNDOABLE,
+			NULL, NULL, NULL);
 		sqlite3_result_error_code(context, rc);
-		sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
-		return 0;
 	}
-	
-	return 1;
+	else {
+		sqlite_undo_undoable_active_flag = 1;
+	}
+
+	sqlite3_exec(db,"RELEASE SAVEPOINT " SQLITE_UNDO_SAVEPOINT_UNDOABLE,
+			NULL, NULL, NULL);
+
 }
 
-static void sqlite_undo_undoable_begin(sqlite3_context *context, int argc,
+static  sqlite_undo_undoable_active(sqlite3_context *context, int argc,
 				sqlite3_value **argv)
 {
-	sqlite_undo_undoable_begin_do(context, argc, argv);
+	sqlite3_result_int(context, sqlite_undo_undoable_active_flag);
 }
 
 static void sqlite_undo_undoable_end(sqlite3_context *context, int argc,
@@ -442,97 +461,48 @@ static void sqlite_undo_undoable_end(sqlite3_context *context, int argc,
 	char *result;
 	sqlite3 *db;
 
-	db = sqlite3_context_db_handle(context);
+	if (sqlite_undo_undoable_active_flag) {
+		db = sqlite3_context_db_handle(context);
 
-	sqlite3_exec(db, "UPDATE _undo_active SET active=NULL",
-		NULL, NULL, NULL);
+		result = sqlite3_mprintf("UNDO=%lld\nREDO=%lld",
+				sqlite_undo_get_buffer_status(db, 'U'),
+				sqlite_undo_get_buffer_status(db, 'R'));
 
-	/* 
-	 * sqlite3_get_autocommit returns 0 if inside a transaction. The
-	 * only way we cannot be in a transaction here is if a commit or
-	 * rollback has been issued between sqlite_undo_undoable_begin() and
-	 * sqlite_undo_undoable_end(). This is not allowed, so assume a commit 
-	 * or rollback has occurred if sqlite_get_autocommit returns 
-	 * non-zero
-	 */
-	if (sqlite3_get_autocommit(db)) {
+		sqlite3_result_text(context, result, -1, sqlite3_free);	
+
+		sqlite_undo_undoable_active_flag = 0;
+	}
+	else {
 		sqlite3_result_error(context,
-				SQLITE_UNDO_ERRMSG_ROLLBACK_OCCURRED, -1);
+				SQLITE_UNDO_ERRMSG_UNDOABLE_NOT_ACTIVE, -1);
 		return;
 	}
-
-	if (sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK) {
-		sqlite3_result_error(context,
-				SQLITE_UNDO_ERRMSG_COMMIT_FAILED, -1);
-		return;
-	}
-
-	result = sqlite3_mprintf("UNDO=%lld\nREDO=%lld",
-			sqlite_undo_get_buffer_status(db, 'U'),
-			sqlite_undo_get_buffer_status(db, 'R'));
-
-	sqlite3_result_text(context, result, -1, sqlite3_free);
 }
 
-static void sqlite_undo_undoable(sqlite3_context *context, int argc,
-			sqlite3_value **argv)
+static int sqlite_undo_step_get_transaction_rowid(sqlite3 *db, char U_R,
+						sqlite_int64 *rowid)
 {
 	int rc;
-	char *query;
-	sqlite3 *db;
-
-	if ((sqlite3_value_type(argv[0]) != SQLITE_TEXT)) {
-		sqlite3_result_error(context,
-				SQLITE_UNDO_ERRMSG_SQL_MUST_BE_TEXT, -1);
-		return;		
-	}
-
-	query = (char*)sqlite3_value_text(argv[0]);
-
-	if(!sqlite_undo_undoable_begin_do(context, argc, argv)) { 
-		return;
-	}
-
-	db = sqlite3_context_db_handle(context);
-
-	rc = sqlite3_exec(db, query, NULL, NULL, NULL);
-
-	if (rc != SQLITE_OK) {
-		sqlite3_result_error_code(context, rc);
-		return;
-	}
-
-	sqlite_undo_undoable_end(context, argc, argv);
-}
-
-static int sqlite_undo_step_get_transaction_bounds(sqlite3 *db, char *un_re,
-						sqlite_int64 *tstart,
-						sqlite_int64 *tend)
-{
-	int rc;
-	char *sql;
 	sqlite3_stmt *stmt;
 
 	assert(db);
-	assert((strcmp(un_re,"un") == 0) || 
-		(strcmp(un_re, "re") == 0));
-	assert(tstart);
-	assert(tend);
+	assert(U_R == 'U' || U_R == 'R');
+	assert(rowid);
 
-	sql = sqlite3_mprintf("SELECT tstart,tend FROM _%sdo_stack_top",
-			un_re);
+	rc =  sqlite3_prepare_v2(db, 
+			"SELECT max(rowid) FROM " SQLITE_UNDO_TABLE " "
+			"WHERE status=?",
+			-1, &stmt, NULL);
 
-	rc =  sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
 
-	sqlite3_free(sql);
+	sqlite3_bind_text(stmt, 1, &U_R, 1, SQLITE_STATIC);
 
 	if (rc == SQLITE_OK) {
 		rc = sqlite3_step(stmt);
 	}
 
 	if (rc == SQLITE_ROW) {
-		*tstart = sqlite3_column_int64(stmt, 0);
-		*tend = sqlite3_column_int64(stmt, 1);
+		*rowid = sqlite3_column_int64(stmt, 0);
 	}
 
 	sqlite3_finalize(stmt);
@@ -541,84 +511,60 @@ static int sqlite_undo_step_get_transaction_bounds(sqlite3 *db, char *un_re,
 }
 
 static int sqlite_undo_step_get_transaction_sql(sqlite3_context *context,
-						sqlite_int64 tstart,
-						sqlite_int64 tend,
+						sqlite_int64 rowid,
 						char **sql)
 {
 	int rc;
-	char *_sql = NULL, *s;
 	sqlite3 *db;
 	sqlite3_stmt *stmt;
 
 	assert(context);
-	assert(tstart >= 0);
-	assert(tend >= 0);
+	assert(rowid >= 0);
 
 	db = sqlite3_context_db_handle(context);
 
 	rc = sqlite3_prepare_v2(db,
-			"SELECT s FROM _undo WHERE rowid>? AND rowid<=?",
+			"SELECT sql FROM " SQLITE_UNDO_TABLE " WHERE rowid=?",
 			-1, &stmt, NULL);
 
-	if (rc != SQLITE_OK) {
-		return rc;
-	}
+	if (rc == SQLITE_OK) {
+		sqlite3_bind_int64(stmt, 1, rowid);
 
-	sqlite3_bind_int64(stmt, 1, tstart);
-	sqlite3_bind_int64(stmt, 2, tend);
+		rc = sqlite3_step(stmt);
 
-	while ((rc = sqlite3_step(stmt)) != SQLITE_DONE) {
 		if (rc == SQLITE_ROW) {
-			if (!_sql) {
-				_sql = sqlite3_mprintf("%s", 
-						sqlite3_column_text(stmt, 0));
-			}
-			else {
-				s = _sql;
-				_sql = sqlite3_mprintf("%s;%s", s,
-						sqlite3_column_text(stmt, 0));
-				sqlite3_free(s);
-			}
+			*sql = sqlite3_mprintf("%s",
+					sqlite3_column_text(stmt, 0));
+			rc = SQLITE_OK;
 		}
 		else {
-			break;
+			*sql = NULL;
 		}
-	}
 
-	sqlite3_finalize(stmt);
-
-	if (rc == SQLITE_DONE) {
-		*sql = _sql;
-	}
-	else {
-		sqlite3_free(_sql);
+		sqlite3_finalize(stmt);
 	}
 
 	return rc;
 }
 
 static int sqlite_undo_step_delete_transaction(sqlite3_context *context,
-					sqlite_int64 tstart,
-					sqlite_int64 tend)
+					sqlite_int64 rowid)
 {
 	int rc;
 	sqlite3 *db;
 	sqlite3_stmt *stmt;
 
 	assert(context);
-	assert(tstart >= 0);
-	assert(tend >= 0);
+	assert(rowid > 0);
 
 	db = sqlite3_context_db_handle(context);
 
 	rc = sqlite3_prepare_v2(db,
-			"DELETE FROM _undo "
-			"WHERE rowid>=? AND rowid<=?",
+			"DELETE FROM " SQLITE_UNDO_TABLE " WHERE rowid=?",
 			-1, &stmt, NULL);
 
 	if (rc == SQLITE_OK) {
-		sqlite3_bind_int64(stmt, 1, tstart);
-		sqlite3_bind_int64(stmt, 2, tend);
+		sqlite3_bind_int64(stmt, 1, rowid);
 
 		rc = sqlite3_step(stmt);
 
@@ -640,7 +586,8 @@ static int sqlite_undo_step_prep_log(sqlite3_context *context, char U_R)
 	db = sqlite3_context_db_handle(context);
 
 	rc = sqlite3_prepare_v2(db,
-			"INSERT INTO _undo(s) VALUES(?)",
+			"INSERT INTO " SQLITE_UNDO_TABLE "(sql, status) "
+			"VALUES('',?)",
 			-1, &stmt, NULL);
 
 	if (rc == SQLITE_OK) {
@@ -654,63 +601,70 @@ static int sqlite_undo_step_prep_log(sqlite3_context *context, char U_R)
 	return rc;
 }
 
-static void sqlite_undo_step(sqlite3_context *context, char *un_re, char U_R)
+static void sqlite_undo_do(sqlite3_context *context,
+			SqliteUndoOrRedo undo_or_redo)
 {
 	int rc;
-	sqlite_int64 tstart = -1LL, tend = -1LL;
+	sqlite_int64 rowid = -1LL;
 	char *sql = NULL, *result;
 	sqlite3 *db;
 
 	assert(context);
-	assert((strcmp(un_re,"un") == 0) || 
-		(strcmp(un_re, "re") == 0));
-	assert(U_R == 'U' || U_R == 'R');
+	assert(undo_or_redo == SqliteUndoUndo || 
+		undo_or_redo == SqliteUndoRedo);
 
 	db = sqlite3_context_db_handle(context);
 
-	rc = sqlite_undo_step_get_transaction_bounds(db, un_re, &tstart, &tend);;
+	rc = sqlite_undo_step_get_transaction_rowid(db, 
+			undo_or_redo == SqliteUndoUndo ? 'U' : 'R', &rowid);
 
-	switch (rc) {
-	case SQLITE_DONE :
+	if (rc != SQLITE_ROW) {
+		goto result_error;
+	}
+	
+	if (rowid == 0LL) {
 		sqlite3_result_null(context);
 		return;
-	case SQLITE_ROW :
-		break;
-	default :
+	}
+
+	rc = sqlite_undo_step_get_transaction_sql(context, rowid, &sql);
+	if (rc != SQLITE_OK) {
 		goto result_error;
 	}
 
-	rc = sqlite_undo_step_get_transaction_sql(context, tstart, tend, &sql);
-	if (rc != SQLITE_DONE) {
+	if(sql == NULL) {
+		sqlite3_result_null(context);
+		return;
+	}
+
+	rc = sqlite3_exec(db, "SAVEPOINT " SQLITE_UNDO_SAVEPOINT_UNDO,
+			NULL, NULL, NULL);
+	if (rc != SQLITE_OK) {
 		goto result_error;
 	}
 
-	sqlite3_exec(db, "BEGIN", NULL, NULL, NULL);
-
-	rc = sqlite_undo_step_delete_transaction(context, tstart, tend);
+	rc = sqlite_undo_step_delete_transaction(context, rowid);
 	if (rc != SQLITE_DONE) {
 		goto rollback;
 	}
 
-	rc = sqlite_undo_step_prep_log(context, U_R);
+	rc = sqlite_undo_step_prep_log(context,
+				undo_or_redo == SqliteUndoUndo ? 'R' : 'U');
 	if (rc != SQLITE_DONE) {
 		goto rollback;
 	}
 
-	sqlite3_exec(db, "UPDATE _undo_active SET active=1",
-		NULL, NULL, NULL);
-
+	sqlite_undo_undoable_active_flag = 1; /* Capture mirror undo/redo */
 	rc = sqlite3_exec(db, sql, NULL, NULL, NULL);
-
-	sqlite3_exec(db, "UPDATE _undo_active SET active=NULL",
-		NULL, NULL, NULL);
+	sqlite_undo_undoable_active_flag = 0;
 
 	if (rc != SQLITE_OK) {
 		goto rollback;
 	}
 
-	sqlite3_exec(db, "END", NULL, NULL, NULL);
-	
+	sqlite3_exec(db, "RELEASE SAVEPOINT " SQLITE_UNDO_SAVEPOINT_UNDO,
+		NULL, NULL, NULL);
+
 	result = sqlite3_mprintf("UNDO=%lld\nREDO=%lld\nSQL=%s",
 			sqlite_undo_get_buffer_status(db, 'U'),
 			sqlite_undo_get_buffer_status(db, 'R'),
@@ -723,7 +677,10 @@ static void sqlite_undo_step(sqlite3_context *context, char *un_re, char U_R)
 	return;
 
 rollback:
-	sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+	sqlite3_exec(db,
+		"ROLLBACK TO SAVEPOINT " SQLITE_UNDO_SAVEPOINT_UNDO ";"
+		"RELEASE SAVEPOINT " SQLITE_UNDO_SAVEPOINT_UNDO,
+		NULL, NULL, NULL);
 result_error:
 	sqlite3_result_error_code(context, rc);
 	sqlite3_free(sql);
@@ -732,13 +689,13 @@ result_error:
 static void sqlite_undo_undo(sqlite3_context *context, int argc,
 			sqlite3_value **argv)
 {
-	sqlite_undo_step(context, "un", 'R');
+	sqlite_undo_do(context, SqliteUndoUndo);
 }
 
 static void sqlite_undo_redo(sqlite3_context *context, int argc,
 			sqlite3_value **argv)
 {
-	sqlite_undo_step(context, "re", 'U');
+	sqlite_undo_do(context, SqliteUndoRedo);
 }
 
 #if !SQLITE_CORE
@@ -750,73 +707,18 @@ int sqlite3UndoInit(sqlite3 *db)
 	SqliteUndoFunction *function;
 	static SqliteUndoFunction functions[] = {
 		{"undoable_table", 2, sqlite_undo_undoable_table},
-		{"undoable", 1, sqlite_undo_undoable},
+		{"undoable_active", 0, sqlite_undo_undoable_active},
 		{"undoable_begin", 0, sqlite_undo_undoable_begin},
-		{"undoable_end", 0, sqlite_undo_undoable_end},
+		{"undoable_end",   0, sqlite_undo_undoable_end},
 		{"undo", 0, sqlite_undo_undo},
 		{"redo", 0, sqlite_undo_redo},
 		{NULL}
 	};
 
 	rc = sqlite3_exec(db,
-		"CREATE TEMP TABLE _undo(s TEXT);"
-
-		"CREATE TEMP TABLE _undo_active(active INTEGER);"
-		"INSERT INTO _undo_active(active) VALUES(NULL);"
-
-		"CREATE TEMP VIEW _undo_stack AS "
-			"SELECT T1.rowid AS tstart,"
-				"coalesce("
-					"("
-						"SELECT T2.rowid "
-						"FROM _undo T2 "
-						"WHERE T2.rowid>T1.rowid "
-						"AND (T2.s='U' OR T2.s='R') "
-						"LIMIT 1"
-					")-1,"
-					"("
-						"SELECT max(rowid) "
-						"FROM _undo"
-					")"
-				") AS tend "
-			"FROM _undo T1 "
-			"WHERE T1.s='U' "
-			"ORDER BY rowid DESC;"
-
-		"CREATE TEMP VIEW _undo_stack_top AS "
-				"SELECT tstart,tend FROM _undo_stack LIMIT 1;"
-
-		"CREATE TEMP VIEW _redo_stack AS "
-			"SELECT T1.rowid AS tstart,"
-				"coalesce("
-					"("
-						"SELECT T2.rowid "
-						"FROM _undo T2 "
-						"WHERE T2.rowid>T1.rowid "
-						"AND (T2.s='U' OR T2.s='R') "
-						"LIMIT 1"
-					")-1,"
-					"("
-						"SELECT max(rowid) "
-						"FROM _undo"
-					")"
-				") AS tend "
-				"FROM _undo T1 "
-				"WHERE T1.s='R' "
-				"ORDER BY rowid DESC;"
-
-			"CREATE TEMP VIEW _redo_stack_top AS "
-				"SELECT tstart,tend FROM _redo_stack LIMIT 1;"
-
-			"CREATE TEMP VIEW _redo_row_ids AS "
-				"SELECT T2.rowid "
-				"FROM _redo_stack T1 "
-					"LEFT JOIN _undo T2 "
-					"ON T2.rowid "
-					"BETWEEN T1.tstart AND T1.tend "
-				"ORDER BY T2.rowid DESC;",
-
-				NULL, NULL, NULL);
+		"CREATE TEMP TABLE " SQLITE_UNDO_TABLE
+			"(sql TEXT, status TEXT)",
+		NULL, NULL, NULL);
 
 	if (rc != SQLITE_OK) {
 		return rc;
