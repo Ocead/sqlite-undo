@@ -133,7 +133,7 @@ static char *sqlite_undo_append_update_column_trigger(char *triggers,
 		"BEGIN "
 			"UPDATE " SQLITE_UNDO_TABLE " "
 			"SET sql=sql || "
-				"'UPDATE %s SET %s "
+				"'UPDATE %s SET %s = '||quote(OLD.%s)||' "
 				"WHERE rowid='||OLD.rowid||';' "
 			"WHERE ROWID=("
 				"SELECT MAX(ROWID) FROM " SQLITE_UNDO_TABLE
@@ -164,7 +164,7 @@ static char *sqlite_undo_prepend_update_table_trigger(char *triggers,
 		"BEGIN "
 			"UPDATE " SQLITE_UNDO_TABLE " "
 			"SET sql=sql || "
-				"'UPDATE %s SET %s "
+				"'UPDATE %s SET %s = '||quote(OLD.%s)||' "
 				"WHERE rowid='||OLD.rowid||';' "
 			"WHERE ROWID=("
 				"SELECT MAX(ROWID) FROM " SQLITE_UNDO_TABLE
@@ -172,7 +172,7 @@ static char *sqlite_undo_prepend_update_table_trigger(char *triggers,
 		"END;",
 		triggers ? triggers : "",
 		table, table,
-		table, columns);
+		table, columns, columns);
 
 	sqlite3_free(triggers);
 

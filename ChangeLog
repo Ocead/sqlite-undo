@@ -1,3 +1,8 @@
+2022-09-04 14:40 johannes.milczewski
+
+	* Bumped version to 0.4
+	  Bug fix: missing values on UPDATE entries in _sqlite_undo
+
 2009-07-19 08:00  snaunton
 
 	* Bumped version to 0.3
